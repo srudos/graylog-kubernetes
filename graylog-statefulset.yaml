@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graylog
+  namespace: logging
+  labels:
+    component: graylog
+data:
+  master-override.conf: |
+    is_master=true
+  slave-override.conf: |
+    is_master=false
+---
+apiVersion: apps/v1beta2
+kind: StatefulSet
+metadata:
+  name: graylog
+  namespace: logging
+  labels:
+    component: graylog
+spec:
+  selector:
+    matchLabels:
+      component: graylog
+  updateStrategy:
+    type: RollingUpdate
+  serviceName: graylog-svc 
+  podManagementPolicy: OrderedReady
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        component: graylog
+    spec:
+      initContainers:
+      - name: graylog-init
+        image: graylog/graylog:2.4
+        imagePullPolicy: IfNotPresent
+        command:
+        - bash
+        - "-c"
+        - |
+          updateMainConfigFile () {
+            overrideFile=$1
+            mainFile=$2
+            cat $overrideFile | egrep -v "^[[:space:]]*$|^[[:space:]]*#" | \
+            while read line; do
+              key=${line%%=*}
+              cat $mainFile | sed "s/^$key.*/$line/" > /tmp/config.tmp
+              mv /tmp/config.tmp $mainFile
+            done
+          }
+
+          # Retrieve all files
+          cp -R /usr/share/graylog/data/config/* /tmp/graylog/conf/
+
+          # Override main config file
+          if [[ ${HOSTNAME##*-} ==  0 ]]; then
+            updateMainConfigFile /tmp/config-map/master-override.conf /tmp/graylog/conf/graylog.conf
+          else
+            updateMainConfigFile /tmp/config-map/slave-override.conf /tmp/graylog/conf/graylog.conf
+          fi
+
+        volumeMounts:
+        - name: conf
+          mountPath: /tmp/graylog/conf
+        - name: config-map
+          mountPath: /tmp/config-map
+
+      terminationGracePeriodSeconds: 10
+      containers:
+      - name: graylog
+        image: graylog/graylog:2.4
+        imagePullPolicy: IfNotPresent
+        readinessProbe:
+          httpGet:
+            path: /api/system/lbstatus
+            port: 12900
+          periodSeconds: 2
+          initialDelaySeconds: 20
+          failureThreshold: 2
+          successThreshold: 1
+          timeoutSeconds: 5
+        ports:
+        - containerPort: 12900
+        - containerPort: 9000
+
+        volumeMounts:
+        - name: conf
+          mountPath: /usr/share/graylog/data/config
+
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+        - name: "GRAYLOG_ELASTICSEARCH_HOSTS"
+          value: "http://elasticsearch.kube-system:9200/"
+
+        - name: "GRAYLOG_ELASTICSEARCH_DISCOVERY_ENABLED"
+          value: "true"
+
+        - name: "GRAYLOG_MONGODB_URI"
+          value: "mongodb://mongo-svc:27017/graylog?replicaSet=rs0"
+
+        - name: "GRAYLOG_PASSWORD_SECRET"
+          value: "somepasswordpepper"
+
+        - name: "GRAYLOG_ROOT_PASSWORD_SHA2"
+          value: "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"
+
+        - name: "GRAYLOG_WEB_ENDPOINT_URI"
+          value: "http://graylog/api/"
+
+        - name: "GRAYLOG_REST_TRANSPORT_URI"
+          value: "http://graylog-svc:12900/api/"
+
+        - name: "GRAYLOG_REST_LISTEN_URI"
+          value: "http://0.0.0.0:12900/api/"
+
+        #- name: "GRAYLOG_WEB_LISTEN_URI"
+        #  value: "http://0.0.0.0:9000/"
+
+        - name: "GRAYLOG_ROOT_TIMEZONE"
+          value: "US/Central"
+
+      volumes:
+      - name: conf
+        emptyDir: {}
+      - name: config-map
+        configMap:
+          name: graylog 
+ 
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    component: graylog
+  name: graylog-svc
+  namespace: logging
+spec:
+  selector:
+      component: graylog
+  ports:
+  - port: 9000
+    targetPort: 9000
+    protocol: TCP
+    name: web-ui
+  - port: 12900
+    targetPort: 12900
+    protocol: TCP
+    name: api
+  - port: 5044
+    protocol: TCP
+    targetPort: 5044
+    name: input-beat
+  - port: 12201
+    protocol: UDP
+    targetPort: 12201
+    name: input-gelf-udp
+
+  sessionAffinity: None
+  type: ClusterIP
+---
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: graylog-ingress
+  namespace: logging
+spec:
+  rules:
+  - host: graylog
+    http:
+      paths:
+      - path: /api
+        backend:
+          serviceName: graylog-svc
+          servicePort: 12900
+      - path: /
+        backend:
+          serviceName: graylog-svc
+          servicePort: 9000
+
